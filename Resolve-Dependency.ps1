@@ -96,6 +96,15 @@ catch
     Write-Warning -Message "Error attempting to import Bootstrap's default parameters from $(Join-Path $PSScriptRoot '.\Resolve-Dependency.psd1'): $($_.Exception.Message)."
 }
 
+# Air-gap override: if PSModuleGallery env var is set and Gallery was not
+# explicitly provided on the command line, use the env var value so the
+# pipeline can redirect to a local PSRepository without modifying this file.
+if ($env:PSModuleGallery -and -not $PSBoundParameters.ContainsKey('Gallery'))
+{
+    Write-Verbose "Bootstrap: Overriding Gallery with `$env:PSModuleGallery = '$env:PSModuleGallery'"
+    $Gallery = $env:PSModuleGallery
+}
+
 Write-Progress -Activity "Bootstrap:" -PercentComplete 0 -CurrentOperation "NuGet Bootstrap"
 
 if (!(Get-PackageProvider -Name NuGet -ForceBootstrap -ErrorAction SilentlyContinue))

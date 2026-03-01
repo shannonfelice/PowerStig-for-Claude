@@ -1,0 +1,269 @@
+# PowerStig Air-Gapped CI Pipeline
+#
+# Designed for self-hosted Windows runners with NO internet access.
+#
+# Prerequisites on each runner:
+#   1. Windows Server 2019/2022 with PowerShell 5.1 + pwsh (7.x)
+#   2. Git installed and on PATH
+#   3. Artifacts\LocalFeed populated via Scripts\Bundle-Dependencies.ps1
+#   4. Runner registered with labels: [self-hosted, Windows, PowerStig]
+#
+# For GitHub Enterprise Server (GHES) air-gap:
+#   - Mirror actions/checkout and actions/upload-artifact to your GHES instance
+#   - Or pre-cache them on the runner: $RUNNER_TOOL_CACHE
+#
+# For completely infrastructure-free execution, use Invoke-Pipeline.ps1 directly.
+
+name: PowerStig CI
+
+on:
+  push:
+    branches:
+      - '**'
+    paths-ignore:
+      - 'CHANGELOG.md'
+      - '*.md'
+      - 'FILEHASH.md'
+  pull_request:
+    branches:
+      - master
+      - dev
+
+env:
+  FEED_NAME: LocalPSStig
+  LOCAL_FEED_PATH: Artifacts\LocalFeed
+  ARTIFACTS_PATH: Artifacts\BuildOutput
+  TEST_RESULTS_PATH: Artifacts\TestResults
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # ============================================================
+  # Job 1: Build
+  # ============================================================
+  build:
+    name: Build Module
+    runs-on: [self-hosted, Windows, PowerStig]
+    outputs:
+      module-version: ${{ steps.version.outputs.module-version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history required for GitVersion
+
+      - name: Check Environment
+        shell: pwsh
+        run: |
+          .\Scripts\Test-AirGapEnvironment.ps1 -SkipNetworkCheck
+        continue-on-error: false
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: |
+          .\Scripts\Initialize-LocalFeed.ps1 -Force
+
+      - name: Compute Version
+        id: version
+        shell: pwsh
+        run: |
+          $gv = Get-Command 'gitversion' -ErrorAction SilentlyContinue
+          if ($gv) {
+              $json   = & gitversion /output json | ConvertFrom-Json
+              $version = $json.NuGetVersionV2
+          } else {
+              $psd1    = Import-PowerShellDataFile 'source\PowerStig.psd1'
+              $version = $psd1.ModuleVersion
+              Write-Warning "GitVersion not found - using manifest version: $version"
+          }
+          Write-Host "Module version: $version"
+          "module-version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Resolve Dependencies
+        shell: pwsh
+        env:
+          PSModuleGallery: ${{ env.FEED_NAME }}
+        run: |
+          .\build.ps1 -ResolveDependency -Tasks noop -Verbose:$false
+
+      - name: Build Module
+        shell: pwsh
+        env:
+          ModuleVersion: ${{ steps.version.outputs.module-version }}
+        run: |
+          .\build.ps1 -Tasks build
+
+      - name: Package Module (nupkg)
+        shell: pwsh
+        env:
+          ModuleVersion: ${{ steps.version.outputs.module-version }}
+        run: |
+          .\build.ps1 -Tasks pack
+
+      - name: Stage Artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path '${{ env.ARTIFACTS_PATH }}' -Force | Out-Null
+          Copy-Item -Path 'output\' -Destination '${{ env.ARTIFACTS_PATH }}\output' -Recurse -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: ${{ env.ARTIFACTS_PATH }}\output\
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================
+  # Job 2: HQRM Tests
+  # ============================================================
+  test-hqrm:
+    name: HQRM Tests
+    needs: build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: Run HQRM Tests
+        shell: powershell    # Uses Windows PowerShell (5.1) as required by HQRM
+        run: |
+          .\build.ps1 -Tasks hqrmtest
+
+      - name: Publish HQRM Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-hqrm
+          path: output\testResults\NUnit*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 3: Unit Tests
+  # ============================================================
+  test-unit:
+    name: Unit Tests
+    needs: build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: Run Unit Tests
+        shell: powershell
+        run: |
+          .\build.ps1 -Tasks test -PesterScript 'tests/Unit'
+
+      - name: Upload Unit Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit
+          path: |
+            output\testResults\NUnit*.xml
+            output\testResults\JaCoCo*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 4: Integration Tests
+  # ============================================================
+  test-integration:
+    name: Integration Tests
+    needs: build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: Configure WinRM
+        shell: powershell
+        run: winrm quickconfig -quiet
+
+      - name: Run Integration Tests
+        shell: powershell
+        run: |
+          .\build.ps1 -Tasks test -PesterScript 'tests/Integration' -CodeCoverageThreshold 0
+
+      - name: Upload Integration Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-integration
+          path: output\testResults\NUnit*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 5: Collect & Archive All Results
+  # ============================================================
+  collect-results:
+    name: Collect Test Results
+    needs: [test-hqrm, test-unit, test-integration]
+    runs-on: [self-hosted, Windows, PowerStig]
+    if: always()
+
+    steps:
+      - name: Download All Test Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-results-*
+          path: AllTestResults\
+          merge-multiple: true
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: output\
+
+      - name: Write Pipeline Summary
+        shell: pwsh
+        run: |
+          $results = Get-ChildItem -Path 'AllTestResults' -Filter '*.xml' -Recurse
+          Write-Host "Total test result files: $($results.Count)"
+          foreach ($f in $results) { Write-Host "  $($f.Name)" }
+
+      - name: Upload Combined Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-test-results
+          path: AllTestResults\
+          retention-days: 30

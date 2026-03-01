@@ -1,0 +1,342 @@
+# PowerStig Air-Gapped Release Pipeline
+#
+# Triggered by a version tag push (e.g. git tag v4.30.0 && git push --tags).
+# Runs a full build+test cycle, then publishes to the local artifact store.
+# No internet connection required on the runner.
+#
+# To trigger a release:
+#   git tag v4.30.0
+#   git push origin v4.30.0
+
+name: PowerStig Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'    # e.g. v4.30.0
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override module version (leave blank to use GitVersion)'
+        required: false
+        default: ''
+      skip_integration:
+        description: 'Skip integration tests'
+        type: boolean
+        default: false
+
+env:
+  FEED_NAME: LocalPSStig
+  LOCAL_FEED_PATH: Artifacts\LocalFeed
+  RELEASE_PATH: Artifacts\Releases
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # ============================================================
+  # Full Build + All Tests (re-run clean for release)
+  # ============================================================
+  release-build:
+    name: Release Build
+    runs-on: [self-hosted, Windows, PowerStig]
+    outputs:
+      module-version: ${{ steps.version.outputs.module-version }}
+      release-tag: ${{ steps.version.outputs.release-tag }}
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate Environment
+        shell: pwsh
+        run: .\Scripts\Test-AirGapEnvironment.ps1 -SkipNetworkCheck
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1 -Force
+
+      - name: Compute Release Version
+        id: version
+        shell: pwsh
+        run: |
+          # Manual override from workflow_dispatch takes priority
+          $override = '${{ github.event.inputs.version }}'
+          if ($override) {
+              $version = $override.TrimStart('v')
+              Write-Host "Using manual version override: $version"
+          }
+          # Tag-based version
+          elseif ('${{ github.ref }}' -match 'refs/tags/v(.+)') {
+              $version = $Matches[1]
+              Write-Host "Using tag version: $version"
+          }
+          # GitVersion fallback
+          else {
+              $gv = Get-Command 'gitversion' -ErrorAction SilentlyContinue
+              if ($gv) {
+                  $json    = & gitversion /output json | ConvertFrom-Json
+                  $version = $json.NuGetVersionV2
+              } else {
+                  $psd1    = Import-PowerShellDataFile 'source\PowerStig.psd1'
+                  $version = $psd1.ModuleVersion
+              }
+              Write-Host "Using computed version: $version"
+          }
+
+          $tag = "v$version"
+          "module-version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "release-tag=$tag"        | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release: $tag"
+
+      - name: Resolve Dependencies
+        shell: pwsh
+        env:
+          PSModuleGallery: ${{ env.FEED_NAME }}
+        run: .\build.ps1 -ResolveDependency -Tasks noop -Verbose:$false
+
+      - name: Clean Build
+        shell: pwsh
+        run: |
+          if (Test-Path 'output') { Remove-Item 'output' -Recurse -Force }
+
+      - name: Build
+        shell: pwsh
+        env:
+          ModuleVersion: ${{ steps.version.outputs.module-version }}
+        run: .\build.ps1 -Tasks build
+
+      - name: Package (nupkg)
+        shell: pwsh
+        env:
+          ModuleVersion: ${{ steps.version.outputs.module-version }}
+        run: .\build.ps1 -Tasks pack
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-output
+          path: output\
+          retention-days: 7
+          if-no-files-found: error
+
+  # ============================================================
+  # HQRM Tests
+  # ============================================================
+  release-hqrm:
+    name: HQRM Tests
+    needs: release-build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: HQRM Tests
+        shell: powershell
+        run: .\build.ps1 -Tasks hqrmtest
+
+      - name: Upload HQRM Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-hqrm
+          path: output\testResults\NUnit*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Unit Tests
+  # ============================================================
+  release-unit:
+    name: Unit Tests
+    needs: release-build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: Unit Tests
+        shell: powershell
+        run: .\build.ps1 -Tasks test -PesterScript 'tests/Unit'
+
+      - name: Upload Unit Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-unit
+          path: |
+            output\testResults\NUnit*.xml
+            output\testResults\JaCoCo*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Integration Tests (skippable)
+  # ============================================================
+  release-integration:
+    name: Integration Tests
+    needs: release-build
+    runs-on: [self-hosted, Windows, PowerStig]
+    timeout-minutes: 120
+    if: ${{ github.event.inputs.skip_integration != 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-output
+          path: output\
+
+      - name: Initialize Local Feed
+        shell: pwsh
+        run: .\Scripts\Initialize-LocalFeed.ps1
+
+      - name: Configure WinRM
+        shell: powershell
+        run: winrm quickconfig -quiet
+
+      - name: Integration Tests
+        shell: powershell
+        run: .\build.ps1 -Tasks test -PesterScript 'tests/Integration' -CodeCoverageThreshold 0
+
+      - name: Upload Integration Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-integration
+          path: output\testResults\NUnit*.xml
+          if-no-files-found: warn
+
+  # ============================================================
+  # Publish to Local Release Store
+  # ============================================================
+  publish:
+    name: Publish Release
+    needs: [release-hqrm, release-unit, release-integration]
+    runs-on: [self-hosted, Windows, PowerStig]
+    if: always() && needs.release-hqrm.result == 'success' && needs.release-unit.result == 'success'
+    env:
+      MODULE_VERSION: ${{ needs.release-build.outputs.module-version }}
+      RELEASE_TAG: ${{ needs.release-build.outputs.release-tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-output
+          path: output\
+
+      - name: Download All Test Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-test-*
+          path: AllTestResults\
+          merge-multiple: true
+
+      - name: Stage Release Artifacts
+        shell: pwsh
+        run: |
+          $version    = '${{ env.MODULE_VERSION }}'
+          $releasePath = "Artifacts\Releases\PowerStig-$version"
+
+          New-Item -ItemType Directory -Path $releasePath -Force | Out-Null
+
+          # Module folder
+          $mod = Get-ChildItem 'output' -Filter 'PowerStig' -Recurse -Directory | Select-Object -First 1
+          if ($mod) {
+              Copy-Item $mod.FullName "$releasePath\Module" -Recurse -Force
+              Write-Host "Module -> $releasePath\Module"
+          }
+
+          # NuGet package
+          $pkg = Get-ChildItem 'output' -Filter '*.nupkg' -Recurse | Select-Object -First 1
+          if ($pkg) {
+              Copy-Item $pkg.FullName $releasePath -Force
+              Write-Host "Package -> $releasePath\$($pkg.Name)"
+          }
+
+          # Test results
+          $results = Get-ChildItem 'AllTestResults' -Filter '*.xml' -Recurse -ErrorAction SilentlyContinue
+          if ($results) {
+              $testDest = "$releasePath\TestResults"
+              New-Item -ItemType Directory -Path $testDest -Force | Out-Null
+              Copy-Item $results.FullName $testDest -Force
+              Write-Host "Test results ($($results.Count) files) -> $testDest"
+          }
+
+          # Release manifest
+          $manifest = [ordered]@{
+              ModuleName    = 'PowerStig'
+              Version       = $version
+              Tag           = '${{ env.RELEASE_TAG }}'
+              BuildDate     = ([datetime]::UtcNow).ToString('yyyy-MM-dd HH:mm:ss')
+              BuildHost     = $env:COMPUTERNAME
+              GitCommit     = (& git rev-parse HEAD 2>$null).Trim()
+              GitBranch     = (& git rev-parse --abbrev-ref HEAD 2>$null).Trim()
+              PipelineRunId = '${{ github.run_id }}'
+          }
+          $manifest | ConvertTo-Json -Depth 5 |
+              Set-Content "$releasePath\release-manifest.json" -Encoding UTF8
+          Write-Host "Manifest -> $releasePath\release-manifest.json"
+
+          # Publish nupkg to local feed so Install-Module works
+          if ($pkg) {
+              Copy-Item $pkg.FullName 'Artifacts\LocalFeed' -Force
+              Write-Host "Copied nupkg to Artifacts\LocalFeed for Install-Module availability."
+          }
+
+          Write-Host "`nRelease staged at: $releasePath" -ForegroundColor Green
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.RELEASE_TAG }}
+          path: Artifacts\Releases\PowerStig-${{ env.MODULE_VERSION }}\
+          retention-days: 90
+
+      - name: Print Release Summary
+        shell: pwsh
+        run: |
+          Write-Host ''
+          Write-Host ('=' * 60) -ForegroundColor Cyan
+          Write-Host "  PowerStig ${{ env.RELEASE_TAG }} released successfully" -ForegroundColor Cyan
+          Write-Host ('=' * 60) -ForegroundColor Cyan
+          Write-Host "  Version   : ${{ env.MODULE_VERSION }}"
+          Write-Host "  Artifact  : release-${{ env.RELEASE_TAG }}"
+          Write-Host "  Local feed: Artifacts\LocalFeed"
+          Write-Host ''
+          Write-Host "  To install on this machine:" -ForegroundColor Yellow
+          Write-Host "    Install-Module PowerStig -Repository LocalPSStig -RequiredVersion ${{ env.MODULE_VERSION }}" -ForegroundColor Yellow
+          Write-Host ('=' * 60) -ForegroundColor Cyan
